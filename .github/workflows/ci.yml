@@ -1,0 +1,135 @@
+name: Build Docker image (no publish)
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write   # <-- added
+
+env:
+  PYTHON_VERSION: "3.12"
+  BUILD_CONTEXT: .
+  DOCKERFILE_PATH: ./Dockerfile
+  IMAGE_TAG: bull-cow:ci-${{ github.sha }}
+
+jobs:
+  build:
+    name: Install deps & build Docker image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Clear conflicting DOCKER_CONTEXT (if any)
+        run: echo "DOCKER_CONTEXT=" >> "$GITHUB_ENV"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            echo "No requirements.txt found at repo root. Skipping."
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.BUILD_CONTEXT }}
+          file: ${{ env.DOCKERFILE_PATH }}
+          push: false
+          load: true
+          platforms: linux/amd64
+          tags: ${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Docker container
+        run: |
+          echo "Running container..."
+          docker run -d --name treasure -p 5000:5000 -e PORT=5000 ${{ env.IMAGE_TAG }}
+
+      - name: Wait for service & test endpoint
+        run: |
+          set -e
+          ATTEMPTS=20
+          until curl -fsS http://localhost:5000/ > /dev/null; do
+            ATTEMPTS=$((ATTEMPTS-1))
+            if [ $ATTEMPTS -le 0 ]; then
+              echo "Service did not become ready in time. Printing logs..."
+              docker logs treasure || true
+              exit 1
+            fi
+            echo "Service not ready yet, retrying..."
+            sleep 2
+          done
+          echo "Service is up!"
+
+      - name: Log in to GitHub Container Registry
+        if: github.event_name == 'push'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tag image for GHCR
+        if: github.event_name == 'push'
+        run: |
+          RAW_OWNER="${{ github.repository_owner }}"
+          RAW_REPO="${{ github.event.repository.name }}"
+          
+          OWNER="$(echo "$RAW_OWNER" | tr '[:upper:]' '[:lower:]')"
+          REPO="$(echo "$RAW_REPO" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g')"
+
+          GHCR_IMAGE="ghcr.io/${OWNER}/${REPO}"
+          echo "GHCR_IMAGE resolved to: $GHCR_IMAGE"
+
+          
+          docker tag "${{ env.IMAGE_TAG }}" "$GHCR_IMAGE:ci-${{ github.sha }}"
+          echo "GHCR_CI_TAG=$GHCR_IMAGE:ci-${{ github.sha }}" >> "$GITHUB_ENV"
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            docker tag "${{ env.IMAGE_TAG }}" "$GHCR_IMAGE:latest"
+            echo "GHCR_LATEST_TAG=$GHCR_IMAGE:latest" >> "$GITHUB_ENV"
+          fi
+
+      - name: Push image to GHCR
+        if: github.event_name == 'push'
+        run: |
+          set -e
+          docker push "$GHCR_CI_TAG"
+          if [ -n "${GHCR_LATEST_TAG:-}" ]; then
+            docker push "$GHCR_LATEST_TAG"
+          fi
+
+      - name: Debug owner
+        run: |
+          echo "repository: ${{ github.repository }}"
+          echo "repository_owner: ${{ github.repository_owner }}"
+          echo "ref: ${{ github.ref }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "## Build successful!"
+            echo ""
+            echo "**Local image tag:** \`${{ env.IMAGE_TAG }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
