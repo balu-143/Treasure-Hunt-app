@@ -1,5 +1,6 @@
 from flask import Flask, request, session, redirect, url_for, render_template_string
 import random
+import os
 
 app = Flask(__name__)
 app.secret_key = "replace_with_secure_key"
@@ -146,4 +147,8 @@ def reset():
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+   # app.run(debug=True)
+
+   port = int(os.getenv("PORT", "5000"))
+    # IMPORTANT: bind to 0.0.0.0 so it's reachable from outside the container
+   app.run(host="0.0.0.0", port=port, debug=False)
